@@ -11,7 +11,8 @@ import shutil
 import struct
 import uuid
 
-from ..hardware import ROOT, device
+from ..hardware import ROOT, chip_architecture, device
+from . import elf
 
 HERE = ROOT / 'boot/initramfs/nfs'
 FIELDS = {'schema', 'kind', 'profile', 'architecture', 'kernel_release', 'root_id',
@@ -38,8 +39,9 @@ def identity(blob):
         raise ValueError('Unexpected root identity fields')
     if type(value['schema']) is not int or value['schema'] != 1 or value['kind'] != 'orchard.nfs-root':
         raise ValueError('Unsupported NFS root identity')
-    if value['architecture'] != 'aarch64':
-        raise ValueError('NFS startup currently requires aarch64')
+    architecture = value['architecture']
+    if architecture not in ('aarch64', 'armv7l'):
+        raise ValueError('Unsupported NFS root architecture')
     for key in ('image_sha256', 'image_receipt_sha256'):
         if not isinstance(value[key], str) or not re.fullmatch('[0-9a-f]{64}', value[key]):
             raise ValueError('Invalid root digest: ' + key)
@@ -50,23 +52,29 @@ def identity(blob):
     if not isinstance(release, str) or not re.fullmatch('[A-Za-z0-9][A-Za-z0-9._+-]{0,127}', release):
         raise ValueError('Invalid kernel release')
     description = device(value['profile'])
+    expected = 'armv7l' if chip_architecture(description) == 'arm' else 'aarch64'
+    if architecture != expected:
+        raise ValueError('NFS root architecture differs from the device profile')
+    if architecture == 'armv7l' and value['profile'] != 'p105':
+        raise ValueError('ARMv7 NFS startup currently requires P105')
     compatible = description['device']['dt_compatible']
     if (not compatible or any(not re.fullmatch('[a-z0-9,._+-]+', item) for item in compatible)):
         raise ValueError('Invalid profile device-tree identity')
     return value, compatible
 
 
-def static_busybox(path):
+def static_busybox(path, architecture='aarch64'):
     blob = path.read_bytes()
-    if (len(blob) < 64 or blob[:6] != b'\x7fELF\x02\x01' or
-            struct.unpack_from('<H', blob, 18)[0] != 183 or
-            struct.unpack_from('<H', blob, 16)[0] not in (2, 3)):
-        raise ValueError('BusyBox must be an AArch64 little-endian ELF executable')
-    offset = struct.unpack_from('<Q', blob, 32)[0]
-    size, count = struct.unpack_from('<HH', blob, 54)
-    if size < 56 or not count or count > 1024 or offset + size * count > len(blob):
+    header = elf._parts(blob)
+    expected, label = ((1, 40), 'ARMv7') if architecture == 'armv7l' else ((2, 183), 'AArch64')
+    if header is None or header[:2] != expected or struct.unpack_from('<H', blob, 16)[0] not in (2, 3):
+        raise ValueError(f'BusyBox must be a little-endian {label} ELF executable')
+    if architecture == 'armv7l':
+        elf.architecture(blob)  # Also verifies EABI5 and the hard-float ABI.
+    segments = header[2]
+    if not 1 <= len(segments) <= 1024:
         raise ValueError('Invalid BusyBox program headers')
-    if any(struct.unpack_from('<I', blob, offset + number * size)[0] in (2, 3) for number in range(count)):
+    if any(segment[0] in (2, 3) for segment in segments):
         raise ValueError('BusyBox must be static; a dynamic segment or interpreter was found')
     return blob
 
@@ -88,14 +96,20 @@ def network(server, address, export, port):
             'NFS_PORT': str(port), 'NFS_HOST_MAC': mac(host), 'NFS_DEVICE_MAC': mac(guest.ip)}
 
 
-def nfs_modules(kernel, release):
-    """Select the NFSv4 client and its recorded module dependencies."""
+def staged_kernel_image(kernel, release, name):
     kernel = Path(kernel)
     if (kernel / 'kernel.release').read_text().strip() != release:
         raise ValueError('Kernel release differs from the root identity')
-    image = kernel / 'Image.gz'
+    image = kernel / name
     if not image.is_file() or image.is_symlink():
         raise ValueError('Kernel image is missing or linked')
+    return image
+
+
+def nfs_modules(kernel, release):
+    """Select the NFSv4 client and its recorded module dependencies."""
+    kernel = Path(kernel)
+    image = staged_kernel_image(kernel, release, 'Image.gz')
     directory = kernel / 'lib/modules' / release
     if not directory.is_dir() or directory.is_symlink():
         raise ValueError('Kernel module tree is missing or linked')
@@ -146,16 +160,47 @@ def nfs_modules(kernel, release):
     return image, files, depfile
 
 
+def nfs3_kernel(kernel, release):
+    """Check the P105 kernel provides the NFSv3 client without module loading."""
+    if kernel is None:
+        raise ValueError('P105 NFS startup requires the matching --kernel-dir')
+    kernel = Path(kernel)
+    image = staged_kernel_image(kernel, release, 'zImage')
+    metadata = kernel / 'lib/modules' / release / 'modules.builtin'
+    if not metadata.is_file() or metadata.is_symlink():
+        raise ValueError('Kernel built-in module list is missing or linked')
+    required = {'kernel/fs/nfs/nfs.ko', 'kernel/fs/nfs/nfsv3.ko'}
+    if not required.issubset(metadata.read_text().splitlines()):
+        raise ValueError('P105 NFS startup requires a built-in NFSv3 client')
+    notes = kernel / 'kernel.notes.sha256'
+    if notes.is_symlink() or (notes.exists() and not notes.is_file()):
+        raise ValueError('Invalid kernel notes digest')
+    digest = ''
+    if notes.is_file():
+        digest = notes.read_text().strip()
+        if not re.fullmatch('[0-9a-f]{64}', digest):
+            raise ValueError('Invalid kernel notes digest')
+    return image, digest
+
+
 def stage(*, receipt, busybox, output, server, address, export, port,
           function='ecm', handoff='manual', kernel_dir=None, keep_rescue=False):
     receipt, busybox, output = Path(receipt), Path(busybox), Path(output)
     blob = receipt.read_bytes()
     root, compatible = identity(blob)
-    binary = static_busybox(busybox)
+    armv7 = root['architecture'] == 'armv7l'
+    binary = static_busybox(busybox, root['architecture'])
     values = network(server, address, export, port)
     if function not in ('ecm', 'ncm') or handoff not in ('manual', 'auto') or type(keep_rescue) is not bool:
         raise ValueError('Unsupported USB function or handoff policy')
-    modules = nfs_modules(kernel_dir, root['kernel_release']) if kernel_dir is not None else None
+    modules = None
+    if armv7:
+        image, notes = nfs3_kernel(kernel_dir, root['kernel_release'])
+        values['NFS_VERSION'] = '3'
+        if notes:
+            values['NFS_KERNEL_NOTES_SHA256'] = notes
+    elif kernel_dir is not None:
+        modules = nfs_modules(kernel_dir, root['kernel_release'])
     values.update(NFS_PROFILE=root['profile'], NFS_ARCHITECTURE=root['architecture'],
                   NFS_KERNEL_RELEASE=root['kernel_release'], NFS_ROOT_ID=root['root_id'],
                   NFS_IDENTITY_SHA256=hashlib.sha256(blob).hexdigest(),
@@ -173,6 +218,10 @@ def stage(*, receipt, busybox, output, server, address, export, port,
         destination.chmod(0o755)
     # Generated for this root's device: a local choice, not a project setting.
     (output / 'orchard.local.toml').write_text('device = "' + root['profile'] + '"\n')
+    if armv7:
+        # The built-in P105 SGX driver probes before the NFS root exists.
+        # orchard run adds the board's private firmware as an initramfs layer.
+        (output / 'orchard.toml').write_text('name = "p105-nfs-root"\n\n[payload]\nfirmware = true\n')
     (output / 'rootfs/etc/orchard/nfs-root.json').write_bytes(blob)
     config = '# Generated from a validated root receipt; source only from this RAM image.\n'
     config += ''.join(name + '=' + shlex.quote(value) + '\n' for name, value in sorted(values.items()))
@@ -180,6 +229,8 @@ def stage(*, receipt, busybox, output, server, address, export, port,
     (output / 'rootfs/etc/orchard/nfs.conf').chmod(0o600)
     result = {'schema': 1, 'kind': 'orchard.nfs-runtime', 'root': root, 'network': values,
               'busybox_sha256': hashlib.sha256(binary).hexdigest()}
+    if armv7:
+        result['kernel'] = {'image_sha256': hashlib.sha256(image.read_bytes()).hexdigest(), 'modules': {}}
     if modules:
         image, files, depfile = modules
         destination = output / 'rootfs/lib/modules' / root['kernel_release']
@@ -205,7 +256,7 @@ def main():
     parser.add_argument('--port', type=int, required=True)
     parser.add_argument('--function', choices=('ecm', 'ncm'), default='ecm')
     parser.add_argument('--handoff', choices=('manual', 'auto'), default='manual')
-    parser.add_argument('--kernel-dir', type=Path, help='staged matching kernel with modular NFS client')
+    parser.add_argument('--kernel-dir', type=Path, help='staged matching kernel for the selected NFS client')
     parser.add_argument('--keep-rescue', action='store_true', help='keep the physical root shell after handoff')
     args = parser.parse_args()
     try:

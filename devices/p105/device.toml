@@ -16,6 +16,8 @@ board = 0x0a
 methods = ["jailbreak-kdfu", "recovery-autogo"]
 entries = ["pico-checkm8", "kdfu"]
 # The CLI consumes an owner-private boot manifest. Public launch assets await release integration.
+# This board booted Orchard's Linux RAM image through a separate launcher.
+# The hardware record for the Cascadia loader is in boot/cascadia/README.md.
 
 [kernel]
 platform = "apple-armv7"  # kernel/series/apple-armv7, kernel/configs/apple-armv7
@@ -61,6 +63,8 @@ suspend = "missing"
 resume = "missing"
 # The cold-handoff USB topic awaits an exact-revision boot.
 # See docs/bring-up/p105-usb-handoff.md for observations and software checks.
+# The ARMv7 RAM runtime mounts a host's NFSv3 root over USB ECM.
+# See boot/initramfs/nfs/README.md for its build and hardware test status.
 usb_serial = "untested"
 usb_network = "untested"
 usb_host = "missing"

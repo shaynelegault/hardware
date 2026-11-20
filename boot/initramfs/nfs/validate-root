@@ -11,6 +11,10 @@ for compatible in $NFS_COMPATIBLE; do
 done
 [ "$matched" = true ] || reject 'device tree differs'
 [ "${1:-}" != --board ] || exit 0
+if [ -n "${NFS_KERNEL_NOTES_SHA256:-}" ]; then
+    notes=$(sha256sum /sys/kernel/notes) || reject 'cannot hash live kernel notes'
+    [ "${notes%% *}" = "$NFS_KERNEL_NOTES_SHA256" ] || reject 'kernel notes digest differs'
+fi
 root=${1:-/newroot}
 for directory in etc etc/orchard usr usr/lib usr/lib/systemd usr/lib/modules \
     "usr/lib/modules/$NFS_KERNEL_RELEASE" dev proc sys run; do
@@ -29,8 +33,17 @@ set -- $(sha256sum "$metadata")
 systemd=$root/usr/lib/systemd/systemd
 safe_file "$systemd"
 [ -x "$systemd" ] || reject 'systemd is not executable'
-# ELF64, little endian, AArch64. Do not invoke a binary from the NFS root here.
+# Do not invoke a binary from the NFS root here.
 header=$(dd if="$systemd" bs=1 count=6 2>/dev/null | od -An -v -tx1 | tr -d ' \n')
 machine=$(dd if="$systemd" bs=1 skip=18 count=2 2>/dev/null | od -An -v -tx1 | tr -d ' \n')
-[ "$header:$machine" = 7f454c460201:b700 ] || reject 'systemd ELF ABI differs'
+case "$NFS_ARCHITECTURE:$header:$machine" in
+    aarch64:7f454c460201:b700) ;;
+    armv7l:7f454c460101:2800)
+        # ELF32 ARM EABI5 hard-float. e_flags is little endian at byte 36.
+        set -- $(dd if="$systemd" bs=1 skip=36 count=4 2>/dev/null | od -An -v -tx1)
+        [ "$#" -eq 4 ] && [ "$4" = 05 ] && [ $((0x$2 & 6)) -eq 4 ] ||
+            reject 'systemd ELF ABI differs'
+        ;;
+    *) reject 'systemd ELF ABI differs' ;;
+esac
 safe_file "$root/usr/lib/modules/$NFS_KERNEL_RELEASE/modules.dep"

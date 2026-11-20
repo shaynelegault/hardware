@@ -336,13 +336,18 @@ class InstalledBundle(unittest.TestCase):
         from test_armv7_direct import P105
         from test_cascadia_loader import kernel, loader, tree
         from orchard.image import cascadia
-        image, _ = cascadia.assemble(loader(P105), kernel(), cascadia.write_fdt(tree()), b'RAMDISK', P105)
-        patched = cascadia.with_serial(image, 'F4KESER1AL00')
+        board_loader = loader(P105)
+        zimage = kernel()
+        dtb = cascadia.write_fdt(tree())
+        serial = 'F4KESER1AL00'
+        image, _ = cascadia.assemble(board_loader, zimage, dtb, b'RAMDISK', P105)
+        patched = cascadia.with_serial(image, serial)
+        built_for_board, _ = cascadia.assemble(board_loader, zimage, dtb, b'RAMDISK', P105, serial=serial)
+        self.assertEqual(patched, built_for_board)
         config = cascadia.configuration(patched)
         root = cascadia.read_fdt(patched[config['dtb_offset']:config['dtb_offset'] + config['dtb_size']])[0]
         self.assertEqual(root['properties']['serial-number'], b'F4KESER1AL00\0')
         self.assertEqual(patched[config['initrd_offset']:], b'RAMDISK')
-        self.assertEqual(patched[:0x8000][:4], image[:4])
         with self.assertRaises(ValueError):
             cascadia.with_serial(image, 'not a serial;')
 

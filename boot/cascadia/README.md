@@ -44,5 +44,15 @@ orchard copies its whole initrd plus the boot's add-on
 (`src/orchard/install_direct.py`), which works with either kernel: with an
 initrd built into the kernel, the copy is unpacked over it.
 
-See `NOTICE` for source provenance. This producer contacts no device; the
-payload has not been booted on hardware yet.
+## P105 hardware record
+
+An iPad mini 1 (P105) ran the loader in this directory and reached the
+Omarchy-A desktop using a root filesystem served over USB NFS. Using the
+board identity recorded for that session, the image preparation in
+`orchard run` reproduced all 12,132,755 bytes of the payload that booted.
+
+That session used a separate launcher for the handoff from iOS. On the
+Mac, `orchard run` hands the finished image to `orchard-launcher`. A
+hardware test of that interface on P105 is still pending.
+
+See `NOTICE` for the loader's source and credits.
