@@ -16,6 +16,8 @@ board = 0x0a
 methods = ["jailbreak-kdfu", "recovery-autogo"]
 entries = ["pico-checkm8", "kdfu"]
 # The CLI consumes an owner-private boot manifest. Public launch assets await release integration.
+# This board booted Orchard's Linux RAM image through a separate launcher.
+# The hardware record for the Cascadia loader is in boot/cascadia/README.md.
 
 [kernel]
 platform = "apple-armv7"  # kernel/series/apple-armv7, kernel/configs/apple-armv7

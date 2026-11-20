@@ -12,7 +12,7 @@ stages = ["iBSS", "iBEC"]
 
 [evidence]
 firmware = "P105 recipe for iOS 8.4.1 encrypted images (docs/bring-up/p105-firmware.md)"
-platform = "P105 on a Cascadia-based build"
+platform = "A physical P105 booted Orchard's Cascadia loader and reached the Omarchy-A desktop over USB NFS (boot/cascadia/README.md)."
 nfs_root = "The P105 ARMv7 kernel has a built-in NFSv3 client for USB network roots (boot/initramfs/nfs/README.md)."
 stages = "Project Cascadia P105 boot chain"
 reference_version = "Project Cascadia builds its A5 boot chain from 8.4.1 / 12H321"

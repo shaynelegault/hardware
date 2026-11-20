@@ -12,5 +12,5 @@ This producer keeps those entry safeguards. Hardware addresses come from
 the device's profile. Orchard's configuration record replaces the loader's
 compiled-in DTB address and Cascadia's overlay header; the initramfs is
 copied before the MMU is turned off and the DTB's initrd placeholders are set
-in place, as Cascadia's linux_boot.c and assemble.py do. Not yet booted on
-hardware in this form.
+in place, as Cascadia's linux_boot.c and assemble.py do. See README.md for
+the P105 hardware record.
