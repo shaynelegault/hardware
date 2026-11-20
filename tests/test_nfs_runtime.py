@@ -18,11 +18,22 @@ HERE = stage.HERE
 
 def elf(machine=183, interpreter=False):
     blob = bytearray(120)
-    blob[:6] = b'\x7fELF\x02\x01'
+    blob[:7] = b'\x7fELF\x02\x01\x01'
     struct.pack_into('<HH', blob, 16, 2, machine)
     struct.pack_into('<Q', blob, 32, 64)
     struct.pack_into('<HH', blob, 54, 56, 1)
     struct.pack_into('<I', blob, 64, 3 if interpreter else 1)
+    return bytes(blob)
+
+
+def arm_elf(flags=0x05000400, interpreter=False):
+    blob = bytearray(84)
+    blob[:7] = b'\x7fELF\x01\x01\x01'
+    struct.pack_into('<HH', blob, 16, 2, 40)
+    struct.pack_into('<I', blob, 28, 52)
+    struct.pack_into('<I', blob, 36, flags)
+    struct.pack_into('<HH', blob, 42, 32, 1)
+    struct.pack_into('<I', blob, 52, 3 if interpreter else 1)
     return bytes(blob)
 
 
@@ -62,6 +73,13 @@ class NFSStaging(unittest.TestCase):
         root['extra'] = 'field'
         with self.assertRaisesRegex(ValueError, 'Unexpected'):
             stage.identity(json.dumps(root).encode())
+
+    def test_p105_receipt_architecture_has_to_match_board(self):
+        root = identity()
+        for profile, architecture in (('j71b', 'armv7l'), ('p105', 'aarch64')):
+            candidate = dict(root, profile=profile, architecture=architecture)
+            with self.subTest(profile=profile), self.assertRaisesRegex(ValueError, 'architecture differs'):
+                stage.identity(json.dumps(candidate).encode())
 
     def test_network_cannot_select_another_subnet_or_shell_syntax(self):
         network = stage.network('10.61.0.1', '10.61.0.2/30', '/n61-root', 32061)
@@ -161,6 +179,45 @@ class NFSStaging(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'Unsafe kernel module path'):
                 stage.nfs_modules(kernel, release)
 
+    def test_stage_p105_requires_builtin_v3_and_binds_kernel_notes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            release = '6.12.0-orchard-apple-armv7'
+            root = dict(identity(), profile='p105', architecture='armv7l', kernel_release=release)
+            receipt, busybox, kernel = base / 'identity.json', base / 'busybox', base / 'kernel'
+            receipt.write_text(json.dumps(root))
+            busybox.write_bytes(arm_elf())
+            modules = kernel / 'lib/modules' / release
+            modules.mkdir(parents=True)
+            (kernel / 'kernel.release').write_text(release + '\n')
+            (kernel / 'zImage').write_bytes(b'P105 kernel image')
+            (kernel / 'kernel.notes.sha256').write_text('c' * 64 + '\n')
+            opts = dict(receipt=receipt, busybox=busybox, output=base / 'ram', server='10.61.0.1',
+                        address='10.61.0.2/30', export='/root', port=2049)
+            with self.assertRaisesRegex(ValueError, 'matching --kernel-dir'):
+                stage.stage(**opts)
+            builtin = modules / 'modules.builtin'
+            builtin.write_text('kernel/fs/nfs/nfs.ko\n')
+            with self.assertRaisesRegex(ValueError, 'built-in NFSv3'):
+                stage.stage(**opts, kernel_dir=kernel)
+            builtin.write_text('kernel/fs/nfs/nfs.ko\nkernel/fs/nfs/nfsv3.ko\n')
+            busybox.write_bytes(arm_elf(interpreter=True))
+            with self.assertRaisesRegex(ValueError, 'static'):
+                stage.stage(**opts, kernel_dir=kernel)
+            busybox.write_bytes(arm_elf(flags=0x05000200))
+            with self.assertRaisesRegex(ValueError, 'hard-float'):
+                stage.stage(**opts, kernel_dir=kernel)
+            self.assertFalse(opts['output'].exists())
+            busybox.write_bytes(arm_elf())
+            result = stage.stage(**opts, kernel_dir=kernel)
+            self.assertEqual(result['network']['NFS_VERSION'], '3')
+            self.assertIn('firmware = true', (opts['output'] / 'orchard.toml').read_text())
+            self.assertEqual(result['network']['NFS_COMPATIBLE'], 'apple,p105ap')
+            self.assertEqual(result['network']['NFS_CLIENT_MODULES'], 'no')
+            self.assertEqual(result['network']['NFS_KERNEL_NOTES_SHA256'], 'c' * 64)
+            self.assertEqual(result['kernel'], {
+                'image_sha256': hashlib.sha256(b'P105 kernel image').hexdigest(), 'modules': {}})
+
 
 class NFSRuntimeValidation(unittest.TestCase):
     def setUp(self):
@@ -180,13 +237,13 @@ class NFSRuntimeValidation(unittest.TestCase):
         self.systemd.chmod(0o755)
         self.modules = self.root / 'usr/lib/modules' / self.metadata['kernel_release'] / 'modules.dep'
         self.modules.write_text('')
-        config = self.base / 'nfs.conf'
-        config.write_text("NFS_ARCHITECTURE=aarch64\nNFS_KERNEL_RELEASE=" + self.metadata['kernel_release'] +
-                          "\nNFS_COMPATIBLE=apple,j71b\nNFS_IDENTITY_SHA256=" +
-                          hashlib.sha256(self.receipt.read_bytes()).hexdigest() + '\n')
+        self.config = self.base / 'nfs.conf'
+        self.config.write_text("NFS_ARCHITECTURE=aarch64\nNFS_KERNEL_RELEASE=" + self.metadata['kernel_release'] +
+                               "\nNFS_COMPATIBLE=apple,j71b\nNFS_IDENTITY_SHA256=" +
+                               hashlib.sha256(self.receipt.read_bytes()).hexdigest() + '\n')
         self.compatible = self.base / 'compatible'
         self.compatible.write_bytes(b'apple,j71b\x00apple,t8010\x00')
-        source = (HERE / 'validate-root').read_text().replace('/etc/orchard/nfs.conf', str(config))
+        source = (HERE / 'validate-root').read_text().replace('/etc/orchard/nfs.conf', str(self.config))
         source = source.replace('/proc/device-tree/compatible', str(self.compatible))
         self.validator = self.base / 'validate-root'
         self.validator.write_text(source)
@@ -197,13 +254,13 @@ class NFSRuntimeValidation(unittest.TestCase):
         shim = ('#!' + sys.executable + '\nimport os,pathlib,sys\n'
                 "if pathlib.Path(sys.argv[0]).name=='stat':\n"
                 " p=pathlib.Path(sys.argv[3]); print('0' if sys.argv[2]=='%u' else format(p.stat().st_mode & 0o7777,'o'))\n"
-                "else: print('aarch64' if sys.argv[1]=='-m' else os.environ['TEST_KERNEL_RELEASE'])\n")
+                "else: print(os.environ['TEST_MACHINE' if sys.argv[1]=='-m' else 'TEST_KERNEL_RELEASE'])\n")
         for name in ('stat', 'uname'):
             path = self.shims / name
             path.write_text(shim)
             path.chmod(0o755)
         self.env = dict(os.environ, PATH=str(self.shims) + os.pathsep + os.environ['PATH'],
-                        TEST_KERNEL_RELEASE=self.metadata['kernel_release'])
+                        TEST_KERNEL_RELEASE=self.metadata['kernel_release'], TEST_MACHINE='aarch64')
         if shutil.which('sha256sum') is None:
             path = self.shims / 'sha256sum'
             path.write_text('#!' + sys.executable + '\nimport hashlib,pathlib,sys\np=pathlib.Path(sys.argv[1]); print(hashlib.sha256(p.read_bytes()).hexdigest(),p)\n')
@@ -231,6 +288,23 @@ class NFSRuntimeValidation(unittest.TestCase):
         self.systemd.write_bytes(elf(machine=62))
         self.assertIn('systemd ELF ABI differs', self.validate().stderr)
 
+    def test_p105_requires_matching_notes_and_hard_float_systemd(self):
+        notes = self.base / 'kernel-notes'
+        notes.write_bytes(b'expected kernel notes')
+        config = self.config.read_text().replace('aarch64', 'armv7l').replace('apple,j71b', 'apple,p105ap')
+        self.config.write_text(config + 'NFS_KERNEL_NOTES_SHA256=' + hashlib.sha256(notes.read_bytes()).hexdigest() + '\n')
+        self.validator.write_text(self.validator.read_text().replace('/sys/kernel/notes', str(notes)))
+        self.compatible.write_bytes(b'apple,p105ap\x00')
+        self.env['TEST_MACHINE'] = 'armv7l'
+        self.systemd.write_bytes(arm_elf())
+        self.assertEqual(self.validate().returncode, 0)
+        for blob in (elf(), arm_elf(flags=0x05000200), arm_elf(flags=0x04000400)):
+            self.systemd.write_bytes(blob)
+            self.assertIn('systemd ELF ABI differs', self.validate().stderr)
+        notes.write_bytes(b'other kernel notes')
+        self.assertEqual(self.validate(board=True).returncode, 0)
+        self.assertIn('kernel notes digest differs', self.validate().stderr)
+
     def test_linked_writable_or_module_incomplete_root_is_refused(self):
         self.receipt.chmod(0o666)
         self.assertIn('group/other writes', self.validate().stderr)
@@ -248,6 +322,50 @@ class NFSRuntimeValidation(unittest.TestCase):
         result = subprocess.run(['sh', str(HERE / 'handoff')], capture_output=True, text=True, timeout=5)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('requires PID 1', result.stderr)
+
+    def test_handoff_selects_tcp_nfs_version(self):
+        source = (HERE / 'handoff').read_text()
+        mount = source[source.index('case "${NFS_VERSION'):
+                       source.index('/sbin/orchard-nfs-validate /newroot')]
+        script = 'timeout() { printf "%s\\n" "$*"; }\n' + mount
+        for version, expected in (('', 'mount -t nfs4 -o vers=4.0,proto=tcp'),
+                                  ('3', 'mount -t nfs -o vers=3,mountproto=tcp,nolock,proto=tcp')):
+            with self.subTest(version=version):
+                env = dict(os.environ, NFS_VERSION=version, NFS_PORT='2049', NFS_SERVER='10.61.0.1', NFS_EXPORT='/root')
+                command = subprocess.check_output(['/bin/sh', '-eu', '-c', script], env=env, text=True)
+                self.assertIn(expected + ',port=2049,addr=10.61.0.1,hard,', command)
+
+    def test_p105_fences_devices_and_rejects_internal_mount_alias(self):
+        source = (HERE / 'handoff').read_text()
+        fence = source[source.index('fence_p105_storage() {'):source.index('failed() {')]
+        disks, mounts, rules = self.base / 'block', self.base / 'mountinfo', self.base / 'udev'
+        for name, number in (('applesftl0', '179:0'), ('applesftl0p1', '179:1')):
+            disk = disks / name
+            disk.mkdir(parents=True)
+            (disk / 'dev').write_text(number + '\n')
+        fence = fence.replace('/sys/class/block', str(disks)).replace('/proc/self/mountinfo', str(mounts))
+        fence = fence.replace('/run/udev/rules.d', str(rules))
+        script = '''
+blockdev() {
+    case "$1" in
+        --setro) printf '%s\\n' "$2" ;;
+        --getro) echo 1 ;;
+        *) return 1 ;;
+    esac
+}
+''' + fence + '\nfence_p105_storage\n'
+        mounts.write_text('25 1 0:1 / / rw - rootfs rootfs rw\n')
+        devices = subprocess.check_output(['/bin/sh', '-eu', '-c', script], text=True).splitlines()
+        self.assertEqual(devices, ['/dev/applesftl0', '/dev/applesftl0p1'])
+        rule = rules / '90-orchard-nfs-p105-storage.rules'
+        self.assertIn('ENV{UDISKS_IGNORE}="1"', rule.read_text())
+        rule.unlink()
+        mounts.write_text('25 1 179:1 / /unexpected ro - hfsplus /dev/alias ro\n')
+        result = subprocess.run(['/bin/sh', '-eu', '-c', script], capture_output=True, text=True, timeout=5)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('internal storage is unmounted', result.stderr)
+        self.assertFalse(result.stdout)
+        self.assertFalse(rule.exists())
 
     def test_post_handoff_root_shell_is_opt_in(self):
         source = (HERE / 'handoff').read_text()

@@ -1,28 +1,25 @@
 # NFS RAM startup
 
 This experimental bring-up runtime starts a systemd root over a dedicated USB
-link. It works with any Orchard device whose descriptor, kernel and USB
-controller meet the requirements below. The board check uses the selected
-descriptor's `dt_compatible`; it is not specific to a device profile.
+link. It begins when the platform loader starts Linux. The board check uses
+the selected descriptor's `dt_compatible`.
 It owns configfs USB, the network link, root validation and the PID 1 handoff.
 The distro prepares the root filesystem and decides which desktop to start.
-Host software supplies the interface and NFS export. This path performs no
-internal-storage operation.
+Host software supplies the interface and NFS export.
 
-The device must run an AArch64 kernel with ECM or NCM, ACM, configfs and its
-USB PHY/controller built in. Configfs must be able to bind the USB device
-controller. NFSv4.0 can be built in or supplied as modules from the same
-kernel build. The root must carry the matching `/usr/lib/modules/<release>`
-tree for other drivers.
+The kernel needs configfs, a USB device controller and built-in support for
+ACM and the selected network function (ECM or NCM). AArch64 devices use
+NFSv4.0, either built in or supplied as modules from the same kernel build.
+The iPad mini 1 (P105) uses the NFSv3 client built into Orchard's ARMv7 kernel.
+The exported root needs the matching `/usr/lib/modules/<release>` tree.
 
-The physical NFS boot tested so far used an iPhone 6 (N61). Other device
-profiles need their own hardware tests. This runtime is for bring-up, with a
-trusted USB host and trusted writable NFS export; it is not an installed
-recovery environment.
+The AArch64 runtime has booted on an iPhone 6 (N61). P105 reached the
+Omarchy desktop using an earlier version of the ARMv7 runtime. A physical
+test of this revision is pending. Use a trusted USB host and writable export.
 
 ## Root identity and staging
 
-Prepare the aarch64 distro root on a filesystem that preserves Linux file
+Prepare the distro root on a filesystem that preserves Linux file
 names, numeric ownership and modes. Copy the exact built kernel module tree
 into `/usr/lib/modules/<kernel_release>`. Leave `/dev`, `/proc`, `/sys` and
 `/run` as real directories. The root's regular, root-owned
@@ -60,20 +57,32 @@ python -m orchard.image.nfs \
   > /path/to/nfs-runtime-receipt.json
 ```
 
-The output uses native `orchard build DIRECTORY` layout, with `init`,
-`orchard.toml` and a `rootfs` overlay. Pass the same `--busybox` and
-`--kernel-dir` to that build, together with the device's loader and boot inputs.
-The shared Apple configurations build NFS as modules. Staging copies the NFSv4
-client and its transitive dependencies from that exact kernel tree into RAM;
-the runtime loads them before mounting the root. pNFS layout modules are not
-needed for the NFSv4.0 mount and are not copied. If a custom kernel has the
-NFS client built in, omit `--kernel-dir` from the staging command.
-Keep the resulting RAM image and staging
-receipt private because they select a specific writable root. The builder
-requires a fresh output path and a static AArch64 BusyBox. ECM is the default;
-NCM can be selected after the host's driver has been qualified. The generated
-MAC addresses derive from the two IPv4 addresses and appear in the runtime
-receipt.
+For P105, set `profile` to `p105` and `architecture` to `armv7l` in the
+root receipt. Supply a static ARM EABI5 hard-float BusyBox and pass the
+staged P105 kernel directory. Staging checks its built-in NFSv3 client.
+If the directory contains `kernel.notes.sha256`, the RAM runtime checks
+the running kernel against that digest before starting systemd.
+
+Staging writes `init`, `orchard.local.toml` and a `rootfs` overlay to a
+fresh directory. The P105 build uses the same BusyBox and kernel along with
+the board's Cascadia loader.
+
+```sh
+bin/orchard build --device p105 --kernel-dir /path/to/staged-kernel \
+  --busybox /path/to/static-armhf-busybox --loader /path/to/cascadia-p105.bin \
+  /path/to/new-ram-root
+```
+
+The P105 project requests board firmware in RAM so the built-in graphics
+driver can find it during probe. The image builder produces `linux.bin`.
+Starting that image on a physical P105 still requires a separate platform
+launcher. Keep the RAM image and staging receipt private because they
+identify a writable root.
+
+For AArch64, staging copies the NFSv4 modules and their dependencies from
+the supplied kernel. If the kernel has built-in NFSv4, omit `--kernel-dir`
+when staging. ECM is the default network function. The receipt records the
+MAC addresses derived from the selected IPv4 addresses.
 
 Use the pinned hardware BusyBox recipe, which supplies `awk`, `mount`, `stat`,
 `sha256sum`, `od`, `timeout`, `setsid`, `modprobe` and `switch_root`. Mount tracking reads
@@ -85,9 +94,10 @@ while the old PID still exists.
 The example link uses host `10.61.0.1`, device `10.61.0.2/30` and NFS TCP port
 `32061`. A dedicated userspace NFS server can expose a Linux volume at an
 NFSv4 pseudo path, with `sec=sys`, writable access, numeric IDs and
-root ownership preserved. The runtime explicitly requests NFSv4.0 over TCP,
-so rpcbind and mountd ports are outside its protocol. Choose an isolated
-subnet, port and export that do not collide with existing host services.
+root ownership preserved. NFSv4.0 uses a single TCP port. For P105, make
+rpcbind and TCP mountd reachable over the USB link. Set `--export` to the
+path served by mountd and `--port` to the NFS data port (usually 2049).
+The NFSv3 client keeps file locks local, so give it a single-client export.
 Before arming handoff, verify through the NFS client that the root metadata
 and systemd retain UID/GID `0:0`; NFSv4 owner mapping must preserve those IDs.
 
@@ -105,7 +115,10 @@ NFS mount; the physical rescue tools remain in RAM.
 After validation, PID 1 moves `/dev`, `/proc`, `/sys` and `/run` into the new
 root and calls BusyBox `switch_root`. The new PID 1 starts systemd and the RAM
 shell is retired. Configure authenticated access, such as key-only SSH, in the
-NFS root before handoff. For experiments that need the RAM shell afterward, pass
+NFS root before handoff. Keep P105 internal flash out of the root's mount and
+swap configuration. Before starting systemd, the runtime rejects mounted
+internal partitions, sets the exposed block devices read-only and tells
+udisks to ignore them. For experiments that need the RAM shell afterward, pass
 `--keep-rescue` during staging. That opt-in starts a transient
 `orchard-acm-rescue.service` under `/run/systemd/system`, using the copied static
 BusyBox and shell from `/run/orchard/rescue`. The opt-in shell remains

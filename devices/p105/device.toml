@@ -61,6 +61,8 @@ suspend = "missing"
 resume = "missing"
 # The cold-handoff USB topic awaits an exact-revision boot.
 # See docs/bring-up/p105-usb-handoff.md for observations and software checks.
+# The ARMv7 RAM runtime mounts a host's NFSv3 root over USB ECM.
+# See boot/initramfs/nfs/README.md for its build and hardware test status.
 usb_serial = "untested"
 usb_network = "untested"
 usb_host = "missing"
